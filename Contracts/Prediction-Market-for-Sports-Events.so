@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract PredictionMarketSports is Ownable, ReentrancyGuard {
+    
+    enum MarketStatus { Active, Resolved, Cancelled }
+    enum Outcome { Pending, TeamA, TeamB, Draw }
+    
+    struct Market {
+        uint256 id;
+        string eventName;
+        string teamA;
+        string teamB;
+        uint256 eventDate;
+        uint256 resolutionDate;
+        MarketStatus status;
+        Outcome result;
+        uint256 totalPoolA;
+        uint256 totalPoolB;
+        uint256 totalPoolDraw;
+        uint256 platformFee; // in basis points (100 = 1%)
+    }
+    
+    struct UserBet {
+        uint256 marketId;
+        Outcome prediction;
+        uint256 amount;
+        bool claimed;
+    }
+    
+    uint256 public marketCounter;
+    uint256 public constant MIN_BET = 0.01 ether;
+    uint256 public constant MAX_PLATFORM_FEE = 500; // 5%
+    uint256 public defaultPlatformFee = 200; // 2%
+    
+    mapping(uint256 => Market) public markets;
+    mapping(uint256 => mapping(address => uint256)) public betsA;
+    mapping(uint256 => mapping(address => uint256)) public betsB;
+    mapping(uint256 => mapping(address => uint256)) public betsDraw;
+    mapping(uint256 => mapping(address => bool)) public claimed;
+    mapping(address => UserBet[]) public userBets;
+    mapping(address => bool) public oracles;
+    
+    event MarketCreated(
+        uint256 indexed marketId,
+        string eventName,
+        string teamA,
+        string teamB,
+        uint256 eventDate
+    );
+    
+    event BetPlaced(
+        uint256 indexed marketId,
+        address indexed bettor,
+        Outcome prediction,
+        uint256 amount
+    );
+    
+    event MarketResolved(
+        uint256 indexed marketId,
+        Outcome result
+    );
+    
+    event WinningsWithdrawn(
+        address indexed winner,
+        uint256 indexed marketId,
+        uint256 amount
+    );
+    
+    modifier onlyOracle() {
+        require(oracles[msg.sender] || msg.sender == owner(), "Not authorized oracle");
+        _;
+    }
+    
+    modifier marketExists(uint256 _marketId) {
+        require(_marketId < marketCounter, "Market does not exist");
+        _;
+    }
+    
+    modifier marketActive(uint256 _marketId) {
+        require(markets[_marketId].status == MarketStatus.Active, "Market not active");
+        require(block.timestamp < markets[_marketId].eventDate, "Betting period ended");
+        _;
+    }
+    
+    constructor() Ownable(msg.sender) {
+        oracles[msg.sender] = true;
+    }
+    
+    // Core Function 1: Create Market
+    function createMarket(
+        string memory _eventName,
+        string memory _teamA,
+        string memory _teamB,
+        uint256 _eventDate,
+        uint256 _resolutionDate
+    ) external onlyOwner returns (uint256) {
+        require(_eventDate > block.timestamp, "Event date must be in future");
+        require(_resolutionDate > _eventDate, "Resolution date must be after event");
+        require(bytes(_eventName).length > 0, "Event name cannot be empty");
+        require(bytes(_teamA).length > 0, "Team A name cannot be empty");
+        require(bytes(_teamB).length > 0, "Team B name cannot be empty");
+        
+        uint256 marketId = marketCounter;
+        marketCounter++;
+        
+        markets[marketId] = Market({
+            id: marketId,
+            eventName: _eventName,
+            teamA: _teamA,
+            teamB: _teamB,
+            eventDate: _eventDate,
+            resolutionDate: _resolutionDate,
+            status: MarketStatus.Active,
+            result: Outcome.Pending,
+            totalPoolA: 0,
+            totalPoolB: 0,
+            totalPoolDraw: 0,
+            platformFee: defaultPlatformFee
+        });
+        
+        emit MarketCreated(marketId, _eventName, _teamA, _teamB, _eventDate);
+        return marketId;
+    }
+    
+    // Core Function 2: Place Bet
+    function placeBet(uint256 _marketId, Outcome _prediction) 
+        external 
+        payable 
+        marketExists(_marketId) 
+        marketActive(_marketId) 
+        nonReentrant 
+    {
+        require(msg.value >= MIN_BET, "Bet amount too low");
+        require(_prediction != Outcome.Pending, "Invalid prediction");
+        
+        Market storage market = markets[_marketId];
+        
+        // Update market pools and user bets
+        if (_prediction == Outcome.TeamA) {
+            market.totalPoolA += msg.value;
+            betsA[_marketId][msg.sender] += msg.value;
+        } else if (_prediction == Outcome.TeamB) {
+            market.totalPoolB += msg.value;
+            betsB[_marketId][msg.sender] += msg.value;
+        } else if (_prediction == Outcome.Draw) {
+            market.totalPoolDraw += msg.value;
+            betsDraw[_marketId][msg.sender] += msg.value;
+        }
+        
+        // Record user bet
+        userBets[msg.sender].push(UserBet({
+            marketId: _marketId,
+            prediction: _prediction,
+            amount: msg.value,
+            claimed: false
+        }));
+        
+        emit BetPlaced(_marketId, msg.sender, _prediction, msg.value);
+    }
+    
+    // Core Function 3: Resolve Market
+    function resolveMarket(uint256 _marketId, Outcome _result) 
+        external 
+        onlyOracle 
+        marketExists(_marketId) 
+    {
+        Market storage market = markets[_marketId];
+        require(market.status == MarketStatus.Active, "Market not active");
+        require(block.timestamp >= market.resolutionDate, "Too early to resolve");
+        require(_result != Outcome.Pending, "Invalid result");
+        
+        market.status = MarketStatus.Resolved;
+        market.result = _result;
+        
+        emit MarketResolved(_marketId, _result);
+    }
+    
+    // Withdraw Winnings Function
+    function withdrawWinnings(uint256 _marketId) 
+        external 
+        marketExists(_marketId) 
+        nonReentrant 
+    {
+        Market storage market = markets[_marketId];
+        require(market.status == MarketStatus.Resolved, "Market not resolved");
+        require(!claimed[_marketId][msg.sender], "Already claimed");
+        
+        uint256 userBet = 0;
+        uint256 winningPool = 0;
+        uint256 totalPool = market.totalPoolA + market.totalPoolB + market.totalPoolDraw;
+        
+        // Determine user's winning bet and winning pool
+        if (market.result == Outcome.TeamA) {
+            userBet = betsA[_marketId][msg.sender];
+            winningPool = market.totalPoolA;
+        } else if (market.result == Outcome.TeamB) {
+            userBet = betsB[_marketId][msg.sender];
+            winningPool = market.totalPoolB;
+        } else if (market.result == Outcome.Draw) {
+            userBet = betsDraw[_marketId][msg.sender];
+            winningPool = market.totalPoolDraw;
+        }
+        
+        require(userBet > 0, "No winning bet found");
+        require(winningPool > 0, "No winning pool");
+        
+        // Calculate winnings
+        uint256 platformFeeAmount = (totalPool * market.platformFee) / 10000;
+        uint256 netPool = totalPool - platformFeeAmount;
+        uint256 winnings = (userBet * netPool) / winningPool;
+        
+        claimed[_marketId][msg.sender] = true;
+        
+        // Transfer winnings
+        require(address(this).balance >= winnings, "Insufficient contract balance");
+        payable(msg.sender).transfer(winnings);
+        
+        emit WinningsWithdrawn(msg.sender, _marketId, winnings);
+    }
+    
+    // View Functions
+    function getMarketDetails(uint256 _marketId) 
+        external 
+        view 
+        marketExists(_marketId) 
+        returns (
+            string memory eventName,
+            string memory teamA,
+            string memory teamB,
+            uint256 eventDate,
+            MarketStatus status,
+            Outcome result,
+            uint256 totalPoolA,
+            uint256 totalPoolB,
+            uint256 totalPoolDraw
+        ) 
+    {
+        Market storage market = markets[_marketId];
+        return (
+            market.eventName,
+            market.teamA,
+            market.teamB,
+            market.eventDate,
+            market.status,
+            market.result,
+            market.totalPoolA,
+            market.totalPoolB,
+            market.totalPoolDraw
+        );
+    }
+    
+    function getUserBets(address _user) external view returns (UserBet[] memory) {
+        return userBets[_user];
+    }
+    
+    function getUserBetAmount(uint256 _marketId, address _user, Outcome _prediction) 
+        external 
+        view 
+        returns (uint256) 
+    {
+        if (_prediction == Outcome.TeamA) {
+            return betsA[_marketId][_user];
+        } else if (_prediction == Outcome.TeamB) {
+            return betsB[_marketId][_user];
+        } else if (_prediction == Outcome.Draw) {
+            return betsDraw[_marketId][_user];
+        }
+        return 0;
+    }
+    
+    function calculatePotentialWinnings(uint256 _marketId, Outcome _prediction, uint256 _betAmount) 
+        external 
+        view 
+        marketExists(_marketId) 
+        returns (uint256) 
+    {
+        Market storage market = markets[_marketId];
+        uint256 totalPool = market.totalPoolA + market.totalPoolB + market.totalPoolDraw + _betAmount;
+        uint256 winningPool = 0;
+        
+        if (_prediction == Outcome.TeamA) {
+            winningPool = market.totalPoolA + _betAmount;
+        } else if (_prediction == Outcome.TeamB) {
+            winningPool = market.totalPoolB + _betAmount;
+        } else if (_prediction == Outcome.Draw) {
+            winningPool = market.totalPoolDraw + _betAmount;
+        }
+        
+        if (winningPool == 0) return 0;
+        
+        uint256 platformFeeAmount = (totalPool * market.platformFee) / 10000;
+        uint256 netPool = totalPool - platformFeeAmount;
+        
+        return (_betAmount * netPool) / winningPool;
+    }
+    
+    function getTotalMarkets() external view returns (uint256) {
+        return marketCounter;
+    }
+    
+    function getContractBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+    
+    // Admin Functions
+    function addOracle(address _oracle) external onlyOwner {
+        oracles[_oracle] = true;
+    }
+    
+    function removeOracle(address _oracle) external onlyOwner {
+        oracles[_oracle] = false;
+    }
+    
+    function cancelMarket(uint256 _marketId) external onlyOwner marketExists(_marketId) {
+        markets[_marketId].status = MarketStatus.Cancelled;
+    }
+    
+    function withdrawPlatformFees() external onlyOwner nonReentrant {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No fees to withdraw");
+        payable(owner()).transfer(balance);
+    }
+    
+    function setDefaultPlatformFee(uint256 _fee) external onlyOwner {
+        require(_fee <= MAX_PLATFORM_FEE, "Fee too high");
+        defaultPlatformFee = _fee;
+    }
+    
+    function emergencyWithdraw() external onlyOwner nonReentrant {
+        payable(owner()).transfer(address(this).balance);
+    }
+}
